@@ -525,9 +525,9 @@ def convert_time_for_frost_api(timestamp: datetime):
 
 def fetch_from_ngi_live(project_id, start_time, end_time, logger_name, sensor_type, secret_client):
     payload = {
-        "sensor": {
+        "sensor_logger": {
             "project": project_id,
-            "loggers": [logger_name],
+            "logger": logger_name,
             "sensor_type": sensor_type
         },
         "sample": {
@@ -538,8 +538,6 @@ def fetch_from_ngi_live(project_id, start_time, end_time, logger_name, sensor_ty
                 "method": "pre_mean",
                 "interval": "1 day"
             }
-        },
-        "process": {
         }
     }
     access_token = get_access_token(
@@ -548,7 +546,7 @@ def fetch_from_ngi_live(project_id, start_time, end_time, logger_name, sensor_ty
         secret_client.get_secret(os.environ['NGILIVE_API_CLIENT_SECRET_SECRET'])
     )
     r = requests.post(
-        f"{os.environ['NGILIVE_API_URL']}/datapoints/loggers",
+        f"{os.environ['NGILIVE_API_URL']}/datapoints/logger",
         json=payload,
         headers={"Authorization": f"Bearer {access_token}"}
     )
@@ -601,14 +599,6 @@ def run(current_time: Optional[datetime]):
     df_1b = fetch_from_ngi_live(int(os.environ['NGILIVE_PROJECT_ID']), start_time, end_time, "DL1", "vwc", secret_client)
     df_1 = pd.merge(df_1a, df_1b, on="timestamp")
     #print(df_1)
-
-    #print(df_1)
-    #df_1.head()
-    # Check the first row for NaN values in each column
-    nan_check = df_1.iloc[0].isna()
-
-    # Update headers where the first value is not NaN
-    df_1.columns = [value if not nan_check[col] else col for col, value in zip(df_1.columns, df_1.iloc[0])]
 
     # Drop the first row
     df_1 = df_1.drop(0)
