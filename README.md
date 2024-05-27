@@ -7,7 +7,7 @@ Install dependencies into virtual environment
 poetry install
 ```
 Create a `.env` file by copying from `.env.template`:
-```
+```bash
 cat .env.template > .env
 ```
 Change any parameters in .env to configure your specific run. Note: the `.env` file is intended for local setup and 
@@ -30,15 +30,15 @@ To test whether the script is runnable in the cloud environment, try to run
 the script in an azure functions docker container.
 
 Build image
-```
+```bash
 docker build -t tmpslopes .
 ```
 Run image in interactive mode
-```
+```bash
 docker run -it tmpslopes bash
 ```
 Inside image, run script
-```
+```bash
 python fos_forecast.py
 ```
 Note that this container does not have access to blob storage or the P drive. It uses
@@ -46,7 +46,7 @@ local temporary input files downloaded from blob storage in a previous local run
 
 # Manually triggering azure timed function
 Get the function url and _master key from the Azure portal "App Keys" pane for the azure function, then run:
-```
+```bash
 curl -kv -XPOST "<function_url>/admin/functions/TimedTrigger" -H "x-functions-key: <master_key>" -H "Content-Type: application/json" -d '{"input": ""}'
 ```
 A 202 response denotes a successful request.
