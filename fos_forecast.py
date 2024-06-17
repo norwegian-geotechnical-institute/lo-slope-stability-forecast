@@ -7,20 +7,13 @@ import os
 import requests
 import argparse
 import pandas as pd
-from io import StringIO
 import numpy as np
 #import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
 from sklearn.metrics import mean_squared_error,  r2_score
-import joblib
-import math
 #from matplotlib.ticker import StrMethodFormatter
 from sklearn.preprocessing import MinMaxScaler
 from dotenv import load_dotenv
-from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
-from azure.keyvault.secrets import SecretClient
-import pastas as ps
 #import plotly.graph_objects as go
 #import plotly.io as pio
 #import matplotlib.cm as cm
@@ -33,528 +26,13 @@ from typing import Optional
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
+from calculations import cyclic_fit,  calculate_relative_humidity, find_arima_order, add_albedo_values
+from predictions import BlobClientLoader,KeyvaultSecretClient, EnvSecretClient, load_model,VWC_RF_predictions,Pastas_predictions,FoS_Predictions
+from fetch_data import convert_time_for_frost_api,fetch_from_ngi_live, GetWeatherForecast,get_access_token
 
 
 
 # In[2]:
-
-
-# Function to fit solar radiation as a cyclic variable
-def cyclic_fit(x, a, b, c, d):
-    return a * np.sin(b * (x - c)) + d
-
-
-# Define functions to calculate saturation vapor pressure, actual vapor pressure, and relative humidity
-def saturation_vapor_pressure(temperature):
-    return 6.11 * math.exp(7.5 * temperature / (237.7 + temperature))
-
-def actual_vapor_pressure(dew_point):
-    return 6.11 * math.exp(7.5 * dew_point / (237.7 + dew_point))
-
-def calculate_relative_humidity(row):
-    temperature = row['mean(air_temperature P1D)_value']
-    dew_point = row['mean(dew_point_temperature P1D)_value']
-    e_s = saturation_vapor_pressure(temperature)
-    e = actual_vapor_pressure(dew_point)
-    return (e / e_s) * 100
-
-def find_arima_order(time_series):
-    # Use pmdarima's auto_arima to find the optimal order
-    model = auto_arima(time_series, suppress_warnings=True)
-    order = model.get_params()['order']
-    return order
-
-
-class BlobClientLoader:
-    def __init__(self, account_url: str, container_name: str):
-        default_credential = DefaultAzureCredential()
-        blob_service_client = BlobServiceClient(account_url, credential=default_credential)
-        self._container_client = blob_service_client.get_container_client(container_name)
-
-    def load_blob(self, src_blob: str, dst_file: str):
-        with open(file=dst_file, mode="wb") as download_file:
-            download_file.write(self._container_client.download_blob(src_blob).readall())
-
-
-class KeyvaultSecretClient:
-    def __init__(self, vault_url: str):
-        credential = DefaultAzureCredential()
-        self._client = SecretClient(vault_url=vault_url, credential=credential)
-
-    def get_secret(self, name: str):
-        return self._client.get_secret(name).value
-
-
-class EnvSecretClient:
-    def get_secret(self, name: str):
-        return os.environ[name]
-
-
-def load_model(filename: str, blob_client_loader: BlobClientLoader | None):
-    if blob_client_loader:
-        models_dir = "tmp_models"
-        if not os.path.exists(models_dir):
-            os.makedirs(models_dir)
-        blob_client_loader.load_blob(filename, os.path.join(models_dir, filename))
-        return joblib.load(os.path.join(models_dir, filename))
-    else:
-        return joblib.load(filename)
-    
-def add_albedo_values(df):
-    # Define a mapping of month and snow depth to albedo values
-    # reference: https://doi.org/10.1080/01431161.2017.1320442 
-    albedo_values = {
-        (1, True): 0.278,  
-        (1, False): 0.335,
-        (2, True): 0.293,
-        (2, False): 0.378,
-        (3, True): 0.233,
-        (3, False): 0.416,
-        (4, True): 0.213,
-        (4, False): 0.375,
-        (5, True): 0.152,
-        (5, False): 0.254,
-        (6, True): 0.138,
-        (6, False): 0.144,
-        (7, True): 0.138,
-        (7, False): 0.135,
-        (8, True): 0.134,
-        (8, False): 0.115,
-        (9, True): 0.127,
-        (9, False): 0.147,
-        (10, True): 0.147,
-        (10, False): 0.224,
-        (11, True): 0.168,
-        (11, False): 0.273,
-        (12, True): 0.21,
-        (12, False): 0.368,
-    }
-    
-    def get_snow_depth(row, df):
-        # Check if Snow_depth value is NaN
-        if pd.isnull(row['Snow_depth']):
-            # print("row.name:", row.name)  # Print row name for debugging
-            # print("Length of DataFrame:", len(df))
-             # Reset index to ensure it's numeric and continuous
-            df_reset = df.reset_index(drop=True)
-            
-            # Find the nearest non-NaN value above and below the current row
-            nearest_above = df_reset.loc[:row.name, 'Snow_depth'].dropna().iloc[-1] if row.name != 0 else float('inf')
-            nearest_below_series = df_reset.loc[row.name:, 'Snow_depth'].dropna()
-            nearest_below = nearest_below_series.iloc[0] if not nearest_below_series.empty else float('inf')
-
-            # Check if nearest_below is infinity (indicating end of the DataFrame)
-            if nearest_below == float('inf'):
-                # If at the end, reverse the DataFrame and perform the operation
-                df_reverse = df_reset[::-1]
-                nearest_below_reverse = df_reverse.loc[:len(df_reset) - row.name - 1, 'Snow_depth'].dropna().iloc[-1] if row.name != len(df_reset) - 1 else float('inf')
-                nearest_above_reverse = df_reverse.loc[len(df_reset) - row.name - 1:, 'Snow_depth'].dropna().iloc[0] if row.name != 0 else float('inf')
-                # Use the nearest value from the reversed DataFrame
-                nearest_below = nearest_below_reverse if abs(nearest_below_reverse - (len(df_reset) - row.name - 1)) < abs(nearest_above_reverse - (len(df_reset) - row.name - 1)) else nearest_above_reverse
-
-            # Use the nearest value to determine whether snow is present or not
-            snow_depth = nearest_above if abs(nearest_above - row.name) < abs(nearest_below - row.name) else nearest_below
-        else:
-            snow_depth = row['Snow_depth']
-        return snow_depth > 0
-    
-    # Add albedo column with mapped values based on month and snow depth
-    df['albedo'] = df.apply(lambda row: albedo_values.get((row['month'], get_snow_depth(row, df)), None), axis=1)
-    
-    return df
-    
-def VWC_RF_predictions(merged_df,loaded_model):
-    #print(merged_df)
-   
-    # Define input and output variables
-    X_forecast = merged_df[[ 'Precipitation','AirTemperature','Wind_speed', 'LAI', 'solar_radiation','RelativeHumidity','Snow_depth','albedo']]
-    # Interpolate NaN values using linear interpolation
-    X_forecast = X_forecast.interpolate(method='linear', limit_direction='both')
-
-    # fill remaining NaN values with the last available value:
-    X_forecast.fillna(method='ffill', inplace=True)
-    # Rename columns in X_forecast
-    X_forecast = X_forecast.rename(columns={
-        'Precipitation':'sum(precipitation_amount P1D)_value',
-        'AirTemperature': 'mean(air_temperature P1D)_value',
-        'Wind_speed': 'mean(wind_speed P1D)_value',
-        'RelativeHumidity': 'relative_humidity',
-        'Snow_depth': 'snow_depth'
-         })
-    #print(X_forecast)
-
-    # Make forecasts for Vol moist content and pore pressure
-    y_forecasts = loaded_model.predict(X_forecast)
-
-        #print(y_forecasts_original_scale)
-    return y_forecasts
-# In[4]:
-
-def Pastas_predictions(merged_df,forecast_df_mean_per_day,specified_duration):
-    #print(merged_df.columns)
-
-    merged_df['date'] = pd.to_datetime(merged_df['mid_time'], utc=True).dt.date
-    #print(merged_df)
-    # Check for duplicate values in the 'date' column
-    duplicate_mask = merged_df.duplicated(subset='date', keep='last')
-
-    # Keep the last row for each duplicate date and delete other rows
-    merged_df = merged_df[~duplicate_mask].sort_values(by='mid_time').reset_index(drop=True)
-    
-    # Check for discontinuity in dates
-    date_range = pd.date_range(start=merged_df['date'].min(), end=merged_df['date'].max(), freq='D')
-    missing_dates = date_range[~date_range.isin(merged_df['date'])]
-    #print(missing_dates)
-    
-    # Add rows corresponding to missing dates and interpolate values
-    for missing_date in missing_dates:
-        if missing_date.date() in merged_df['date'].values:
-            continue  # Skip existing dates
-        else:
-            #print(missing_date.date())  # Print the date without the timestamp
-            missing_date = missing_date.date()
-
-            # Find the closest dates before and after the missing date with a timedelta of 1 day
-            date_before = (pd.to_datetime(missing_date) - pd.Timedelta(days=1)).date()
-            date_after = (pd.to_datetime(missing_date) + pd.Timedelta(days=1)).date()
-            #print(date_before,date_after)
-
-            
-            # Find the index of 'before' or increment the timedelta until it's found
-            index_before = None
-            delta = 1
-            while index_before is None:
-                try:
-                    date_before_candidate = (pd.to_datetime(missing_date) - pd.Timedelta(days=delta)).date()
-                    index_before = merged_df[merged_df['date'] == date_before_candidate].index[0]
-                except IndexError:
-                    delta += 1
-            #print(delta)
-
-            # Find the index of 'date_after' 
-            index_after = index_before+1
-            #print(index_before,index_after)
-            # Interpolate values for each column using linear interpolation
-            interpolated_values = {}
-            for col in merged_df.columns:
-                if col == 'mid_time':
-                    interpolated_values[col] = pd.to_datetime(f"{missing_date} 00:00:00", utc=True)
-                elif col == 'date':
-                    interpolated_values[col] = missing_date
-                else:
-                    x = [index_before, index_after]
-                    #print(x)
-                    # Select rows by their integer position using .iloc[]
-                    y = [merged_df.iloc[index_before][col], merged_df.iloc[index_after][col]]
-                    #print(y)
-                    interpolated_values[col] = np.interp((index_before + ((delta) / (index_after - index_before))), x, y)
-
-            # Add a new row with the current index of 'date_after'
-            merged_df = pd.concat([merged_df.loc[:index_after], pd.DataFrame([interpolated_values], index=[index_after]), merged_df.loc[index_after + 1:]]).sort_index()
-
-
-
-    # Convert 'mid_time' to datetime in UTC
-    merged_df['mid_time'] = pd.to_datetime(merged_df['mid_time'], utc=True)
-
-    # Sort the DataFrame by 'mid_time'
-    merged_df = merged_df.sort_values(by='mid_time').reset_index(drop=True)
-    #print(merged_df.columns)
-    #print(merged_df)
-    days=(specified_duration/24)+1
-    # Define the column names and corresponding series names
-    columns_to_series = {
-        'DL1_WC1': 'vwcdata1',
-        'DL1_WC2': 'vwcdata2',
-        'DL1_WC3': 'vwcdata3',
-        'DL1_WC4': 'vwcdata4',
-        'DL1_WC5': 'vwcdata5',
-        'DL1_WC6': 'vwcdata6',
-        'PZ01_D': 'ppdata1',
-        'AirTemperature': 'temp',
-        'Precipitation': 'precip',
-        'RelativeHumidity': 'hum',
-        'solar_radiation': 'sol',
-        'LAI': 'lai',
-        'Wind_speed':'ws',
-        'Snow_depth':'sd',
-        'albedo':'albedo'
-    }
-    
-    # Create Series from columns in merged_df
-    for column, series_name in columns_to_series.items():
-        series = merged_df[['mid_time', column]].copy()  # Select both columns
-        #print(series['mid_time'])
-        series['mid_time'] = pd.to_datetime(series['mid_time'], utc=True).dt.date  # Extract only the date (in UTC)
-        series.set_index('mid_time', inplace=True)  # Set 'mid_time' as the index
-        series.index = pd.to_datetime(series.index)  # Ensure datetime format without time zone (pastas will fail if time zone aware)
-        series.index.freq='D'
-        globals()[series_name] = series[column]  
-    #print(vwcdata1.index)
-
-    # # #print(series)
-    # import matplotlib.pyplot as plt
-    # # Combine all series into a single DataFrame
-    # df = pd.DataFrame({'P (mm)': precip, 'T (°C)': temp, 'SoR (kW/m²)': sol, 'LAI': lai, 'RH (%)': hum, 'WS (m/s)': ws, 'SD (m)': sd, 'Albedo': albedo})
-
-    # # Set Arial Bold as the font globally
-    # plt.rcParams['font.family'] = 'Arial'
-    # plt.rcParams['font.weight'] = 'bold'
-
-    # # Increase the length of y-axes by adjusting figsize and gridspec_kw
-    # fig, axes = plt.subplots(nrows=len(df.columns), sharex=True, figsize=(10, 14), gridspec_kw={'height_ratios': [1.5] * len(df.columns)})
-
-    # for i, col in enumerate(df.columns):
-    #     axes[i].plot(df.index, df[col], label=col, color='darkblue')
-    #     axes[i].set_ylabel(col, fontsize=14,fontweight='bold')  # Set font size for the y-axis label
-    #     axes[i].tick_params(axis='both', labelsize=14)  # Set font size for tick labels
-
-    # # Customize the plot
-    # axes[-1].set_xlabel('Date', fontsize=14,fontweight='bold')  # Set font size for the x-axis label
-
-    # # Remove the gap between subplots
-    # plt.subplots_adjust(hspace=0)
-
-    # # Save the plot with 600 dpi
-    # plt.savefig('pastas_input_1.png', dpi=600)
-
-    # # Show the plot
-    # plt.show()
-
-    # Define the column names and corresponding series names
-    columns_to_series = {
-        'VWC_0.1m': 'vwcdata1',
-        'VWC_0.5m': 'vwcdata2',
-        'VWC_1.0m': 'vwcdata3',
-        'VWC_2.0m': 'vwcdata4',
-        'VWC_4.0m': 'vwcdata5',
-        'VWC_6.0m': 'vwcdata6',
-        'PP_6.0m': 'ppdata1'
-    }
-    max_trials=5
-    # Iterate over the series names
-    for series_name, column in columns_to_series.items():
-        trials = 0
-        r2 = 0
-        while trials < max_trials and r2 < 0.8:
-            # Create a model object by passing it the observed series
-            ml = ps.Model(globals()[column], name=series_name)
-
-            # Add the rainfall data as an explanatory variable
-            sm = ps.StressModel(precip, ps.Gamma(), name="rainfall", up=True, settings="prec")  # up= True
-            ml.add_stressmodel(sm)
-
-            # Add the temperature data as an explanatory variable
-            sm2 = ps.StressModel(temp, ps.Gamma(), up=False, name="temperature", settings='evap')
-            ml.add_stressmodel(sm2)
-
-            # Add the solar data as an explanatory variable
-            sm3 = ps.StressModel(sol, ps.Gamma(), up=False, name="solar_radiation", settings='evap')
-            ml.add_stressmodel(sm3)
-
-            # Add the LAI data as an explanatory variable
-            sm5 = ps.StressModel(lai, ps.Gamma(), up=True, name="LAI", settings='prec')
-            ml.add_stressmodel(sm5)
-
-            # Add the relative humidity data as an explanatory variable
-            sm6 = ps.StressModel(hum, ps.Gamma(),up=True, name="relative_humidity", settings='prec')
-            ml.add_stressmodel(sm6)
-
-            # Add the wind speed data as an explanatory variable
-            sm7= ps.StressModel(ws, ps.Gamma(),name="Wind_speed", settings='evap')
-            ml.add_stressmodel(sm7)
-
-            if( column==f'vwcdata5'):
-                # Add the snow_depth data as an explanatory variable
-                sm8= ps.StressModel(sd, ps.Gamma(), name="Snow_depth", settings='evap')
-                ml.add_stressmodel(sm8)
-            else:
-                # Add the snow_depth data as an explanatory variable
-                sm8= ps.StressModel(sd, ps.Gamma(), name="Snow_depth", settings='prec')
-                ml.add_stressmodel(sm8)
-
-            # Add the albedo data as an explanatory variable
-            sm9= ps.StressModel(albedo, ps.Gamma(),up=False, name="albedo", settings='evap')
-            ml.add_stressmodel(sm9)
-
-            # Get tmin and tmax from the index of the series
-            tmin = globals()[column].index[0]
-            #tmax_solve = globals()[column].index[int(0.99*len(globals()[column]))]
-            tmax_solve = globals()[column].index[-1]
-            #tmax_plot = globals()[column].index[-1] + pd.Timedelta(days=days)
-            tmax_plot = globals()[column].index[-1] 
-            #print(tmax_solve,tmax_plot)
-
-            # Solve the model
-            ml.solve(tmin=tmin, tmax=tmax_solve)
-                
-            # Plot the results
-            #ml.plot(tmax=tmax_plot)
-            # Get the values used for plotting
-            
-            y_observed = ml.observations()
-            y_predicted = ml.simulate(tmax=tmax_plot)  # predicted values
-
-            # Trim y_predicted to match the length of y_observed
-            y_predicted_trimmed = y_predicted[:len(y_observed)]
-
-            # Calculate R^2 score
-            r2 = r2_score(y_observed, y_predicted_trimmed)
-            print('r2', series_name,':',r2)
-            # Calculate RMSE
-            rmse = np.sqrt(mean_squared_error(y_observed, y_predicted_trimmed))
-            trials += 1
-
-        # # Print the RMSE value
-        # print(f"RMSE_{column}:", rmse)
-
-        # # # Print the R^2 score
-        # print(f"R^2 score_{column}:", r2)
-
-        # # # Print or use the values as needed
-        
-        # # #print("Observed Values:", y_observed)
-        # # #print("Predicted Values:", y_predicted)
-
-        # from matplotlib import rcParams
-        # import matplotlib.pyplot as plt
-        # # Creating a DataFrame for plotting
-        # df_plot = pd.DataFrame({'Observed': y_observed, 'Predicted': y_predicted})
-        # # Set Arial Bold as the default font for the plot
-        # rcParams['font.family'] = 'Arial'
-        # rcParams['font.weight'] = 'bold'
-        # rcParams['font.size'] = 18
-
-
-        # # Plotting
-        # plt.figure(figsize=(12, 8))
-        # plt.plot(df_plot.index, df_plot['Observed'], label='Measured', linewidth=2,color='black')
-        # plt.plot(df_plot.index, df_plot['Predicted'], label='Modelled', linestyle='dashed', linewidth=2.5,color='brown')
-
-        # # Customize plot
-        # plt.xlabel('Date', fontdict={'family': 'Arial', 'size': 24, 'weight': 'bold'})
-        # if( column==f'ppdata1'):
-        #     plt.ylabel('PWP (kPa)', fontdict={'family': 'Arial', 'size': 24, 'weight': 'bold'})
-        # else:
-        #      plt.ylabel('VWC (%)', fontdict={'family': 'Arial', 'size': 24, 'weight': 'bold'})
-        # #plt.xticks(rotation=45, ha='right')
-        # plt.xticks(df_plot.index[::90])  # Show every 90th date
-        # plt.tick_params(axis='both', which='both', direction='in', labelsize=22)
-
-        # # Add legend
-        # plt.legend(fontsize=24)
-        # # Save the plot with 600 dpi
-        # plt.savefig(f'pastas_{column}.png', dpi=600)
-
-        # # # Show the plot
-        # plt.show()
-        y_predicted.index = pd.to_datetime(y_predicted.index, utc=True).date
-        #print(forecast_df_mean_per_day)
-
-        # Merge the DataFrames based on the 'mid_time' column
-        forecast_df_mean_per_day = pd.merge(forecast_df_mean_per_day, pd.DataFrame({f"{series_name}": y_predicted}), left_on='date', right_index=True, how='left')
-        #print(forecast_df_mean_per_day)
-    return forecast_df_mean_per_day
-
-# In[6]:
-
-def FoS_Predictions(final_result,Features_FoS,blob_client_loader):
-    
-    
-    columns_to_predict = [ 'VWC_0.1m', 'VWC_0.5m', 'VWC_1.0m', 'VWC_2.0m', 'VWC_4.0m', 'VWC_6.0m', 'PP_6.0m', 'AirTemperature', 'LAI']
-    # Extract relevant columns from 'final_result'    
-    data_to_predict = final_result[columns_to_predict]
-
-    best_regressor_rf = load_model(os.environ["REGRESSOR_FOS_9_PATH"], blob_client_loader)
-
-    # Load the scaler
-    scaler_rf = load_model(os.environ["SCALER_FOS_9_PATH"], blob_client_loader)
-    
-    # Scale the data using the loaded scaler
-    scaled_data_to_predict_rf = scaler_rf.transform(data_to_predict) 
-    # Make predictions using the loaded RF regressor
-    fos_predictions_rf = best_regressor_rf.predict(scaled_data_to_predict_rf)  
-
-
-    best_regressor_pr = load_model(os.environ["REGRESSOR_FOS_PR_PATH"], blob_client_loader)
-    # Load the scaler
-    scaler_pr = load_model(os.environ["SCALER_FOS_PR_PATH"], blob_client_loader) 
-    converter_pr= load_model(os.environ["POLY_CONVERT_FOS_PR_PATH"], blob_client_loader)  
-    
-    # Scale the data using the loaded scaler
-    scaled_data_to_predict_pr = scaler_pr.transform(data_to_predict)
-    #convert data for PR
-    converted_data_to_predict_pr=converter_pr.transform(scaled_data_to_predict_pr)    
-    # Make predictions using the loaded RF regressor
-    fos_predictions_pr = best_regressor_pr.predict(converted_data_to_predict_pr)
-    
-    # Add 'fos_predictions' as new columns to 'final_result'
-    final_result['FoS_predictions'] = fos_predictions_rf
-    final_result['FoS_predictions_PR'] = fos_predictions_pr
-
-    # Save the result to a CSV file
-    #last_mid_time = final_result['mid_time'].iloc[-1].strftime('%Y-%m-%dT%H-%M-%S')
-   
-    #file_name = f"FoS_prediction_{last_mid_time}.csv"
-    #final_result.to_csv(file_name, index=False)
-
-    # Print the resulting dataframe
-    #print(final_result)
-
-    return final_result
-
-
-def get_access_token(token_provider_url: str, client_id: str, client_secret: str):
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret
-    }
-    r = requests.post(token_provider_url, data=data)
-    if not r.ok:
-        raise Exception(f"Token request failed with error code {r.status_code}: {r.reason}")
-    response_data = r.json()
-    return response_data["access_token"]
-
-
-# Frost API wants times in UTC, but otherwise iso-8601
-# Ref.: https://frost.met.no/concepts2.html#timespecifications
-def convert_time_for_frost_api(timestamp: datetime):
-    return timestamp.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
-
-
-def fetch_from_ngi_live(project_id, start_time, end_time, logger_name, sensor_type, secret_client):
-    payload = {
-        "sensor_logger": {
-            "project": project_id,
-            "logger": logger_name,
-            "sensor_type": sensor_type
-        },
-        "sample": {
-            "start": start_time.isoformat(),
-            "end": end_time.isoformat(),
-            "status_code": 0,
-            "resample": {
-                "method": "pre_mean",
-                "interval": "1 day"
-            }
-        }
-    }
-    access_token = get_access_token(
-        os.environ["NGILIVE_API_TOKEN_PROVIDER_URL"],
-        secret_client.get_secret(os.environ['NGILIVE_API_CLIENT_ID_SECRET']),
-        secret_client.get_secret(os.environ['NGILIVE_API_CLIENT_SECRET_SECRET'])
-    )
-    r = requests.post(
-        f"{os.environ['NGILIVE_API_URL']}/datapoints/logger",
-        json=payload,
-        headers={"Authorization": f"Bearer {access_token}"}
-    )
-    if not r.ok:
-        raise Exception(f"Request to ngi live API failed with error code {r.status_code}: {r.reason}")
-
-    csvStringIO = StringIO(r.text)
-    return pd.read_csv(csvStringIO, sep=",")
 
 def run(current_time: Optional[datetime]):
 
@@ -671,6 +149,7 @@ def run(current_time: Optional[datetime]):
 
     # Reset the index
     df2 = df2.reset_index()
+    #print(df2)
     
 
     # Display the first few rows of the resulting DataFrame
@@ -843,8 +322,12 @@ def run(current_time: Optional[datetime]):
     # Step 3: Merge daily_avg_dew_point with df3 based on 'date'
     df3['referenceTime'] = pd.to_datetime(df3['referenceTime'], utc=True)  # Make sure 'reference_time' is datetime type
     df3['date'] = df3['referenceTime'].dt.date
+    # print(df3)
+    # print(df4)
     # Merge df4 with df3 based on the 'reference_time' column
     df3 = pd.merge(df3, df4[['referenceTime', 'mean(dew_point_temperature P1D)_value', 'mean(wind_speed P1D)_value']], on='referenceTime', how='left')
+    # Drop the 'date' column from df5
+    df5.drop(columns=['date'], inplace=True) 
 
 
     # Print df3 to see the changes
@@ -854,16 +337,38 @@ def run(current_time: Optional[datetime]):
     # In[17]:
 
 
-    # Apply the function to calculate relative humidity and create a new column
-    df3['relative_humidity'] = df3.apply(calculate_relative_humidity, axis=1)
+    # Get the last value in the 'referenceTime' column
+    last_reference_time = df3['referenceTime'].iloc[-1]
+    time_difference = end_time - last_reference_time
+    
+    hours_difference = time_difference.total_seconds() / 3600
+    #print(hours_difference)
 
     # Print the updated DataFrame
     #print(df3)
+    if hours_difference <= 120:
+        #If Minnensund station has data
+        # Apply the function to calculate relative humidity and create a new column
+        df3['relative_humidity'] = df3.apply(calculate_relative_humidity, axis=1)
+    
+        # Merge df5 with df3 based on the 'reference_time' column, and add the columns from df5 to df3
+        df3 = pd.merge(df3, df5, on='referenceTime', how='left')
+        # merging
+        merged_df = pd.merge(df_1, df3, left_on='timestamp', right_on='referenceTime', how='outer')
+    
 
-    # Drop the 'date' column from df5
-    df5.drop(columns=['date'], inplace=True) 
-    # Merge df5 with df3 based on the 'reference_time' column, and add the columns from df5 to df3
-    df3 = pd.merge(df3, df5, on='referenceTime', how='left')
+    
+
+    else:
+        #If Minnensund station does not have data
+        # Apply the function to calculate relative humidity and create a new column
+        df4['relative_humidity'] = df4.apply(calculate_relative_humidity, axis=1)
+        #print(df4)
+
+        # Merge df5 with df4 based on the 'reference_time' column, and add the columns from df5 to df4
+        df4 = pd.merge(df4, df5, on='referenceTime', how='left')
+        # merging
+        merged_df = pd.merge(df_1, df4, left_on='timestamp', right_on='referenceTime', how='outer')
 
     # print(df3)
     # print(df_1)
@@ -873,8 +378,7 @@ def run(current_time: Optional[datetime]):
     # In[18]:
 
 
-    # merging
-    merged_df = pd.merge(df_1, df3, left_on='timestamp', right_on='referenceTime', how='outer')
+    
 
     # Drop the redundant 'referenceTime' column if needed
     merged_df = merged_df.drop('referenceTime', axis=1)
@@ -965,120 +469,8 @@ def run(current_time: Optional[datetime]):
 
 
     # In[23]:
-     
-    
-
-
-    # In[24]:
-    """
-    Created on Sunday February 5 14:30:00 2023
-    
-    @author: EAO
-    """
-
-    def GetWeatherForecast():
-        """
-        This function accesses the weather forecast data from the Norwegian Meteorological Institute, and returns the required data to the user.
-        Written by: Emir Ahmet Oguz, February 5 14:30:00 2023
-
-        Returns
-        -------
-        Time : list
-            List of times in the forecast data as string.
-        Duration : list
-            List of duration of the forrecast at aach time as float.
-        Relative humidity: list
-            List of relative humidity in the forecast data as float.
-        AirTemperature : list
-            List of air temperature in the forecast data as float.
-        Precipitation : list
-            List of precipitation in the forecast data as float.
-
-        """
-
-        ## Libraries
-        ## https://docs.python.org/3/library/urllib.request.html#module-urllib.request
-        ## https://docs.python.org/3/library/json.html
-        import urllib, json
-        from urllib import request, error
-
-        '''
-        ## For the following section, "https://docs.python.org/3/howto/urllib2.html" is utilized.
-        '''
-        ## Define url including the coordinates of the desired location
-        ## Municipality of Eidsvoll, Norway (60°19′23.376", 11°14′44.646")
-        # Latitude  = 60.322
-        # Longitude = 11.245    ## https://www.latlong.net/  & https://www.google.com/maps/search/church+near+Eidsvoll+Municipality/@60.3236357,11.2462548,542m/data=!3m1!1e3
-        # Altitude  = 170       ## https://en-gb.topographic-map.com/map-m45k/Norway/?center=60.32248%2C11.24637&zoom=16&base=6&popup=60.3223%2C11.24617
-        url = "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=60.322&lon=11.245&altitude=170"
-        ## https://www.whatismybrowser.com/detect/what-is-my-user-agent/
-        User_Agent = os.environ['MET_API_USER_AGENT']
-
-        ## Define data to send to the server
-        Values = {'name': 'NGI',
-                  'location': 'Eidsvoll,',
-                  'language': 'Python' }
-        Headers = {'User-Agent': User_Agent}
-
-        ## Generate requert
-        Data = urllib.parse.urlencode(Values)
-        Data = Data.encode('ascii')
-        #req = request.Request(url, Data, Headers)
-        headers = {'user-agent': User_Agent}
-        r6 = requests.get(url, headers=headers)
-        if r6.ok:
-             # Extract JSON data
-            Data = r6.json()
-        else:
-            print (r6.reason)
-            return
-        #print(Data)
-
-
-        ## Open and read url
-        # with urllib.request.urlopen(req) as response:
-        #    The_page = response.read()
-        '''
-        '''
-        ## Take the page and returns the json object
-        # Data = json.loads(The_page)
-        #print(Data)
-
-        ## Allocate lists for required information: Time, air temperature (celcius), precipitation (mm) and duration (hour)
-        Time             = []
-        Duration         = []
-        RelativeHumidity = []
-        AirTemperature   = []
-        Precipitation    = []
-        wind_speed       = []
-
-        ## Read required values from the data
-        for Pred in Data['properties']['timeseries']:
-
-            ## Time current prediction
-            Time.append(Pred['time'])
-            AirTemperature.append(Pred['data']['instant']['details']['air_temperature'])
-            RelativeHumidity.append(Pred['data']['instant']['details']['relative_humidity'])
-            wind_speed.append(Pred['data']['instant']['details']['wind_speed'])
-
-
-            ## Next 1 hour precipitation prediction
-            if('next_1_hours' in Pred['data']):
-                Precipitation.append(Pred['data']['next_1_hours']['details']['precipitation_amount'])
-                Duration.append(1.0)
-            ## Next 6 hour precipitation prediction (take if if there is no 1-hour prediction)
-            elif('next_6_hours' in Pred['data']):
-                 Precipitation.append(Pred['data']['next_6_hours']['details']['precipitation_amount'])
-                 Duration.append(6.0)
-            ## Next 12 hour precipitation prediction (take it if there is no 1 or 6 hour prediction)
-            elif('next_12_hours' in Pred['data']):
-                 Precipitation.append(Pred['data']['next_12_hours']['details']['precipitation_amount'])
-                 Duration.append(12.0)
-
-        ## Return information
-        return Time, Duration, RelativeHumidity, AirTemperature, Precipitation, wind_speed
-
-        ## Get the weather forecast
+        
+     ## Get the weather forecast
     Time, Duration, RelativeHumidity, AirTemperature, Precipitation,wind_speed = GetWeatherForecast()
     ## Only use first 48 hours
     #Time = Time[0:72]
