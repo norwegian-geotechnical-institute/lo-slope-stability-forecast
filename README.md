@@ -44,6 +44,11 @@ python fos_forecast.py
 Note that this container does not have access to blob storage or the P drive. It uses
 local temporary input files downloaded from blob storage in a previous local run.
 
+## Deploying code to production
+Check access to azure devops
+Check the pipelines overview in azure devops project
+"Run pipeline", and select the "Publish app (production environment)" checkbox.
+
 # Manually triggering azure timed function
 Get the function url and _master key from the Azure portal "App Keys" pane for the azure function, then run:
 ```bash
